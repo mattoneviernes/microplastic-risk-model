@@ -2,14 +2,15 @@
 # Predictive Risk Modeling for Microplastic Pollution
 # Updated by: Assistant for mattoneviernes
 # Objectives (updates):
-# 1. Improve data cleaning (readability + consistency)
-# 2. Standardize microplastic taxonomy/categories
-# 3. Add derived / engineered features
-# 4. Add quality checks and robust encoding (lock the feature set)
+# - Sidebar upload that accepts CSV and Excel files
+# - Robust file parsing and sheet selection for Excel
+# - Thorough error handling and fixes for earlier edge-cases
+# - Keep preprocessing, standardization, feature engineering, and modeling flows
 # ==============================================================
 
 import re
 import math
+import io
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -48,14 +49,28 @@ This web app automates:
 )
 
 # -------------------------
-# Helpers: Cleaning & Standardization
+# Helpers: File reading, Cleaning & Standardization
 # -------------------------
-def safe_read_csv(uploaded_file):
+def safe_read_file(uploaded_file, sheet_name=0):
+    """Read CSV or Excel from Streamlit uploader. Returns DataFrame or raises."""
     try:
-        return pd.read_csv(uploaded_file)
-    except Exception:
+        name = getattr(uploaded_file, "name", "")
+        # Work with BytesIO so pandas can read multiple times if needed
         uploaded_file.seek(0)
-        return pd.read_csv(uploaded_file, encoding="latin1")
+        content = uploaded_file.read()
+        uploaded_file.seek(0)
+        if name.lower().endswith((".xls", ".xlsx")):
+            # read_excel supports bytes buffer
+            return pd.read_excel(io.BytesIO(content), sheet_name=sheet_name)
+        else:
+            # try default CSV reading, try latin1 if default fails
+            try:
+                return pd.read_csv(io.BytesIO(content))
+            except Exception:
+                uploaded_file.seek(0)
+                return pd.read_csv(io.BytesIO(content), encoding="latin1")
+    except Exception as e:
+        raise RuntimeError(f"Unable to read uploaded file: {e}")
 
 
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
@@ -63,7 +78,7 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     new_cols = {}
     for c in df.columns:
-        nc = c.strip().lower()
+        nc = str(c).strip().lower()
         nc = re.sub(r"[^\w\s]", "", nc)  # remove punctuation
         nc = re.sub(r"\s+", "_", nc)
         new_cols[c] = nc
@@ -86,11 +101,14 @@ def extract_numeric(value):
     if pd.isna(value):
         return np.nan
     if isinstance(value, (int, float, np.number)):
-        return float(value)
+        try:
+            return float(value)
+        except Exception:
+            return np.nan
     s = str(value).strip()
-    # Remove common thousands separator and non-numeric characters except dot, minus, e
-    # Capture first numeric token
-    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s.replace(",", ""))
+    # Remove commas used as thousands separator but keep decimal points
+    s_clean = s.replace(",", "")
+    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s_clean)
     if m:
         try:
             return float(m.group(0))
@@ -106,7 +124,7 @@ def standardize_microplastic_type(val):
     v = str(val).strip().lower()
     mappings = {
         "fiber": ["fiber", "fibre", "filament", "fibres", "fibers"],
-        "fragment": ["fragment", "flake", "fragments", "flakes", "particle"],
+        "fragment": ["fragment", "flake", "fragments", "flakes", "particle", "fragmented"],
         "film": ["film", "sheet", "film/sheet"],
         "bead": ["bead", "sphere", "spherical", "microbead", "beads"],
         "pellet": ["pellet", "nurdle", "pellets", "nurdles"],
@@ -118,7 +136,7 @@ def standardize_microplastic_type(val):
         for variant in variants:
             if variant in v:
                 return std
-    # fallback: if short token matches
+    # fallback: keep first token as 'other' or 'other' label
     token = re.sub(r"[^a-z0-9]", "", v)
     if token in ["fiber", "fragment", "film", "bead", "pellet", "foam", "granule"]:
         return token
@@ -130,7 +148,6 @@ def standardize_polymer(val):
     if pd.isna(val):
         return np.nan
     v = str(val).strip().lower()
-    # Common mappings
     if re.search(r"\bpe\b|polyethylene", v):
         return "polyethylene (PE)"
     if re.search(r"\bpp\b|polypropylene", v):
@@ -145,7 +162,6 @@ def standardize_polymer(val):
         return "nylon"
     if v in ["unknown", "n/a", "", "na", "unspecified"]:
         return "unknown"
-    # Limit long names
     return v[:50]
 
 
@@ -165,23 +181,32 @@ def derive_features(df: pd.DataFrame) -> pd.DataFrame:
     size_col = find_column(df, ["size", "diameter", "length"])
     if size_col:
         df[f"{size_col}_num"] = df[size_col].apply(extract_numeric)
-        # if typical values are >1000 assume micrometers -> create size_mm
-        df["particle_size_mm"] = df[f"{size_col}_num"].apply(
-            lambda x: x / 1000.0 if pd.notna(x) and x > 10 else (x if pd.isna(x) else x)
-        )
-        # Note: we assume if measured in micrometers often values >10; this is heuristic.
-        # Create size categories using micrometers when possible
+        # Heuristic: if the median value of detected size seems large (>100), interpret as micrometers (µm)
+        median_size = df[f"{size_col}_num"].median(skipna=True)
+        if pd.notna(median_size) and median_size > 100:
+            # convert µm -> mm for a normalized size_mm
+            df["particle_size_mm"] = df[f"{size_col}_num"].apply(lambda x: x / 1000.0 if pd.notna(x) else np.nan)
+        else:
+            # assume values are already in mm (or small µm)
+            df["particle_size_mm"] = df[f"{size_col}_num"]
+
+        # Create size categories based on µm scale (use original numeric when available)
         def size_bucket(x):
             if pd.isna(x):
                 return "unknown"
-            # Use micrometers for binning if original numeric looks like µm scale (>5 typically)
-            # if particle_size_mm exists and <0.001 then it might be micro- to nano.
-            # We'll work with the numeric original if it appears to be µm else mm.
-            if x > 1000:  # >1000 µm -> >1 mm (macro)
+            # Interpret x as µm if median_size > 100 else interpret as mm -> convert to µm
+            if pd.notna(median_size) and median_size > 100:
+                um = x
+            else:
+                # x interpreted as mm -> mm * 1000 to get µm
+                um = x * 1000 if pd.notna(x) else np.nan
+            if pd.isna(um):
+                return "unknown"
+            if um > 1000:
                 return "macro_>1000um"
-            if x > 100:
+            if um > 100:
                 return "micro_100-1000um"
-            if x > 1:
+            if um > 1:
                 return "micro_1-100um"
             return "nano_<1um"
 
@@ -197,7 +222,7 @@ def derive_features(df: pd.DataFrame) -> pd.DataFrame:
         df[f"{conc_col}_log1p"] = df[f"{conc_col}_num"].apply(lambda x: np.log1p(x) if pd.notna(x) else x)
 
     # Derived density or per-area features if area/volume columns exist
-    area_col = find_column(df, ["area", "surface", "m2", "m^2"])
+    area_col = find_column(df, ["area", "surface", "m2", "m^2", "m2"])
     if area_col and conc_col:
         try:
             df["conc_per_area"] = df[f"{conc_col}_num"] / df[area_col].apply(extract_numeric)
@@ -205,8 +230,17 @@ def derive_features(df: pd.DataFrame) -> pd.DataFrame:
             df["conc_per_area"] = np.nan
 
     # Flags
-    df["has_size"] = df.get(f"{size_col}_num", pd.Series(np.nan, index=df.index)).notna().astype(int)
-    df["has_conc"] = df.get(f"{conc_col}_num", pd.Series(np.nan, index=df.index)).notna().astype(int)
+    df["has_size"] = int(1) if any(col.endswith("_num") and "size" in col for col in df.columns) and df[[c for c in df.columns if c.endswith("_num") and "size" in c]].notna().any(axis=1).any() else 0
+    # Per-row flags for presence of size/conc
+    if size_col and f"{size_col}_num" in df.columns:
+        df["has_size"] = df[f"{size_col}_num"].notna().astype(int)
+    else:
+        df["has_size"] = 0
+
+    if conc_col and f"{conc_col}_num" in df.columns:
+        df["has_conc"] = df[f"{conc_col}_num"].notna().astype(int)
+    else:
+        df["has_conc"] = 0
 
     return df
 
@@ -220,7 +254,7 @@ def quality_checks(df: pd.DataFrame) -> pd.DataFrame:
     size_like = [c for c in numeric_cols if "size" in c or "diameter" in c or "length" in c]
     conc_like = [c for c in numeric_cols if "conc" in c or "concentration" in c or "count" in c or "particles" in c]
 
-    for c in size_like + conc_like:
+    for c in set(size_like + conc_like):
         if c in df.columns:
             negs = (df[c] < 0).sum()
             if negs > 0:
@@ -236,12 +270,15 @@ def quality_checks(df: pd.DataFrame) -> pd.DataFrame:
         q1 = ser.quantile(0.25)
         q3 = ser.quantile(0.75)
         iqr = q3 - q1
+        if pd.isna(iqr) or iqr == 0:
+            continue
         lower = q1 - 1.5 * iqr
         upper = q3 + 1.5 * iqr
         outlier_flags[f"{c}_outlier"] = ((df[c] < lower) | (df[c] > upper)).astype(int)
 
     # Attach a summary column (number of numeric outliers per row)
     if not outlier_flags.empty:
+        df = pd.concat([df, outlier_flags], axis=1)
         df["numeric_outlier_count"] = outlier_flags.sum(axis=1)
     else:
         df["numeric_outlier_count"] = 0
@@ -289,7 +326,7 @@ def finalize_encoding(df: pd.DataFrame, target_col: str = None):
     if target_col:
         cat_cols = [c for c in cat_cols if c != target_col]
 
-    # One-hot encode but drop first to avoid collinearity
+    # One-hot encode but drop_first to avoid collinearity
     df_encoded = pd.get_dummies(df, columns=cat_cols, drop_first=True)
     # Drop columns that are exact duplicates of the target (rare) or accidentally created
     if target_col and target_col in df_encoded.columns:
@@ -308,17 +345,47 @@ def describe_df(df):
 
 
 # -------------------------
-# STEP 1: Upload
+# STEP 1: Sidebar Upload (CSV & Excel)
 # -------------------------
-st.header("STEP 1: Upload Dataset")
-uploaded_file = st.file_uploader("Upload your dataset (CSV)", type=["csv"])
+st.sidebar.header("STEP 1: Upload Dataset")
+st.sidebar.write("Supported formats: CSV, XLSX, XLS")
+
+uploaded_file = st.sidebar.file_uploader(
+    "Choose a file",
+    type=["csv", "xls", "xlsx"],
+    help="Upload CSV or Excel. If Excel has multiple sheets, select sheet below.",
+)
+
+# Optional Excel sheet selection (only shown after upload and only for Excel)
+selected_sheet = 0
+if uploaded_file is not None and getattr(uploaded_file, "name", "").lower().endswith((".xls", ".xlsx")):
+    # Try to preview sheet names
+    try:
+        # Read bytes and inspect Excel sheet names
+        uploaded_file.seek(0)
+        excel_bytes = uploaded_file.read()
+        xls = pd.ExcelFile(io.BytesIO(excel_bytes))
+        sheets = xls.sheet_names
+        # Put selection widget in sidebar
+        selected_sheet = st.sidebar.selectbox("Select sheet", options=sheets, index=0)
+        # Reset file pointer
+        uploaded_file.seek(0)
+    except Exception:
+        # If unable to inspect sheet names, fallback to first sheet
+        selected_sheet = 0
 
 if not uploaded_file:
-    st.warning("📂 Please upload your dataset to start preprocessing and modeling.")
+    st.sidebar.info("📂 Upload a CSV or Excel file in the sidebar to start preprocessing and modeling.")
     st.stop()
 
-df_raw = safe_read_csv(uploaded_file)
-st.success("✅ Dataset uploaded successfully.")
+# Read file with robust reader
+try:
+    df_raw = safe_read_file(uploaded_file, sheet_name=selected_sheet)
+    st.sidebar.success("✅ File recognized and read.")
+except Exception as e:
+    st.sidebar.error(f"Failed to read uploaded file: {e}")
+    st.stop()
+
 st.subheader("Preview (first 5 rows)")
 st.dataframe(df_raw.head())
 
@@ -483,9 +550,7 @@ else:
 st.write(f"Detected task type: {task}")
 
 # Prepare X and y: ensure we don't include target-derived columns in X
-# For encoded features, we need to re-run finalize with awareness of target if target is categorical (to avoid encoding it)
 df_encoded_with_target, _ = finalize_encoding(original_df, target_col=target_col)
-# Lock final features from earlier but ensure target columns are excluded
 X = df_encoded_with_target.drop(columns=[c for c in df_encoded_with_target.columns if c == target_col or c.startswith(f"{target_col}_")], errors="ignore")
 # Restrict to locked features intersection to avoid unexpected columns
 X = X[[c for c in locked_features if c in X.columns]]
@@ -493,16 +558,29 @@ X = X[[c for c in locked_features if c in X.columns]]
 # Prepare y
 label_encoder = None
 if task == "classification":
-    if not is_numeric_target:
-        label_encoder = LabelEncoder()
-        y = label_encoder.fit_transform(original_df[target_col].astype(str))
-    else:
-        # numeric but small unique values -> categorical label encode
-        label_encoder = LabelEncoder()
-        y = label_encoder.fit_transform(original_df[target_col].astype(str))
+    try:
+        if not is_numeric_target:
+            label_encoder = LabelEncoder()
+            y = label_encoder.fit_transform(original_df[target_col].astype(str))
+        else:
+            # numeric but small unique values -> categorical label encode
+            label_encoder = LabelEncoder()
+            y = label_encoder.fit_transform(original_df[target_col].astype(str))
+    except Exception as e:
+        st.error(f"Failed to encode classification target: {e}")
+        st.stop()
 else:
     # regression
-    y = original_df[target_col].apply(extract_numeric).astype(float).values
+    try:
+        y = original_df[target_col].apply(extract_numeric).astype(float).values
+    except Exception as e:
+        st.error(f"Failed to parse regression target as numeric: {e}")
+        st.stop()
+
+# Validate shapes
+if X.shape[0] != len(y):
+    st.error("Feature and target lengths do not match after preprocessing. Check the dataset for missing rows or parsing issues.")
+    st.stop()
 
 st.write(f"Feature matrix shape: {X.shape} | Target shape: {y.shape}")
 
