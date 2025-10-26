@@ -5,7 +5,7 @@
 # - Sidebar upload that accepts CSV and Excel files
 # - Robust file parsing and sheet selection for Excel
 # - Thorough error handling and fixes for earlier edge-cases
-# - Keep preprocessing, standardization, feature engineering, and modeling flows
+# - Handle stratification / cross-validation edge-cases when classes are rare
 # ==============================================================
 
 import re
@@ -593,10 +593,23 @@ if task == "classification":
     st.subheader("Classification: Random Forest (default)")
 
     test_size = st.slider("Test set proportion", 0.05, 0.5, 0.2, step=0.05)
-    stratify_flag = True if unique_vals > 1 else False
+
+    # Decide whether to stratify splits based on class counts
+    y_counts = pd.Series(y).value_counts()
+    min_class_count = int(y_counts.min()) if not y_counts.empty else 0
+    total_samples = X.shape[0]
+    # If any class has <2 samples, stratification for train_test_split or StratifiedKFold is not safe.
+    stratify_allowed = min_class_count >= 2
+
+    if not stratify_allowed:
+        st.warning(
+            f"Stratified splitting is disabled because at least one class has fewer than 2 samples (min class count = {min_class_count}). "
+            "The split and cross-validation will use non-stratified K-Fold methods."
+        )
 
     try:
-        if stratify_flag:
+        if stratify_allowed:
+            # stratify only if safe (each class has >=2 samples)
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
         else:
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
@@ -633,20 +646,38 @@ if task == "classification":
         except Exception:
             pass
 
-        # Cross-validation (StratifiedKFold)
+        # Cross-validation (choose StratifiedKFold when safe; otherwise KFold)
         folds = st.slider("K-Folds for cross-validation", 2, 10, 5)
-        cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
-        cv_scores = cross_val_score(clf, X, y, cv=cv, scoring="accuracy")
-        st.write(f"Cross-Validation Accuracy scores: {np.round(cv_scores, 3)}")
-        st.success(f"Average CV accuracy: {np.mean(cv_scores)*100:.2f}% (+/- {np.std(cv_scores)*100:.2f}%)")
 
-        plt.figure(figsize=(6, 4))
-        sns.lineplot(x=range(1, len(cv_scores) + 1), y=cv_scores, marker="o")
-        plt.title("Cross-Validation Accuracy per Fold")
-        plt.xlabel("Fold")
-        plt.ylabel("Accuracy")
-        st.pyplot(plt.gcf())
-        plt.clf()
+        # ensure folds no larger than total samples
+        if folds > total_samples:
+            st.warning(f"Number of folds reduced from {folds} to {total_samples} (can't have more folds than samples).")
+            folds = total_samples if total_samples >= 2 else 2
+
+        # If stratified requested but min_class_count < folds, reduce folds or fallback
+        if stratify_allowed:
+            if min_class_count < folds:
+                st.warning(f"Reducing number of folds from {folds} to {min_class_count} because the smallest class only has {min_class_count} samples.")
+                folds = min_class_count if min_class_count >= 2 else 2
+            cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
+        else:
+            cv = KFold(n_splits=folds, shuffle=True, random_state=42)
+
+        # compute cv scores (wrap in try to surface errors)
+        try:
+            cv_scores = cross_val_score(clf, X, y, cv=cv, scoring="accuracy")
+            st.write(f"Cross-Validation Accuracy scores: {np.round(cv_scores, 3)}")
+            st.success(f"Average CV accuracy: {np.mean(cv_scores)*100:.2f}% (+/- {np.std(cv_scores)*100:.2f}%)")
+
+            plt.figure(figsize=(6, 4))
+            sns.lineplot(x=range(1, len(cv_scores) + 1), y=cv_scores, marker="o")
+            plt.title("Cross-Validation Accuracy per Fold")
+            plt.xlabel("Fold")
+            plt.ylabel("Accuracy")
+            st.pyplot(plt.gcf())
+            plt.clf()
+        except Exception as e:
+            st.error(f"Cross-validation failed: {e}. You may need to reduce folds or disable stratification.")
     except Exception as e:
         st.error(f"Error during classification training: {e}")
 
@@ -690,6 +721,9 @@ else:
 
         # Cross-validation (KFold)
         folds = st.slider("K-Folds for cross-validation (regression)", 2, 10, 5)
+        if folds > X_reg.shape[0]:
+            st.warning(f"Number of folds reduced from {folds} to {max(2, X_reg.shape[0])} because there are fewer samples than folds.")
+            folds = max(2, X_reg.shape[0])
         cv = KFold(n_splits=folds, shuffle=True, random_state=42)
         cv_scores_r2 = cross_val_score(model, X_reg, y, cv=cv, scoring="r2")
         cv_scores_mae = cross_val_score(model, X_reg, y, cv=cv, scoring="neg_mean_absolute_error")
